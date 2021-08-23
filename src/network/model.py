@@ -20,12 +20,85 @@ from tensorflow.keras.callbacks import CSVLogger, TensorBoard, ModelCheckpoint
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.constraints import MaxNorm
 
-from network.layers import FullGatedConv2D, GatedConv2D, OctConv2D
-from tensorflow.keras.layers import Conv2D, Bidirectional, LSTM, GRU, Dense
-from tensorflow.keras.layers import Dropout, BatchNormalization, LeakyReLU, PReLU
-from tensorflow.keras.layers import Input, Add, Activation, Lambda, MaxPooling2D, Reshape
+from network.layers import FullGatedConv2D, GatedConv2D, OctConv2D,pushPull2D,Attention,DoubleDropout
+from tensorflow.keras.layers import Conv2D, Bidirectional, LSTM, GRU, Dense,UpSampling2D
+from tensorflow.keras.layers import Dropout, BatchNormalization, LeakyReLU, PReLU,concatenate
+from tensorflow.keras.layers import Input, Add, Activation, Lambda, MaxPooling2D, Reshape,MultiHeadAttention 
 
+def unet_block(filters,inputs):
+    conv = Conv2D(filters,  kernel_size=(3, 3), activation = 'relu', padding = 'same', kernel_initializer = 'he_normal')(inputs)
+    conv = Conv2D(filters, kernel_size=(3, 3), activation = 'relu', padding = 'same', kernel_initializer = 'he_normal')(conv)
+    drop = DoubleDropout(0.5,.5)(conv)
+    pool = MaxPooling2D(pool_size=(2, 2))(drop)
+    return (drop,pool)
 
+def central_conv_block(filters,inputs):
+    conv = Conv2D(filters, kernel_size=(3, 3), activation = 'relu', padding = 'same', kernel_initializer = 'he_normal')(inputs)
+    conv = Conv2D(filters, kernel_size=(3, 3), activation = 'relu', padding = 'same', kernel_initializer = 'he_normal')(conv)
+    drop = DoubleDropout(0.5,.5)(conv)
+    return drop
+
+def unet_decodeblock(filters,former_image,inputs):
+    up = UpSampling2D(size = (2,2))(inputs)
+    up = Conv2D(filters, kernel_size=(3, 3), activation = 'relu', padding = 'same', kernel_initializer = 'he_normal')(up)
+    merge = concatenate([former_image,up], axis = 3)
+    conv = Conv2D(filters, kernel_size=(3, 3), activation = 'relu', padding = 'same', kernel_initializer = 'he_normal')(merge)
+    conv = Conv2D(filters, kernel_size=(3, 3), activation = 'relu', padding = 'same', kernel_initializer = 'he_normal')(conv)
+    return conv
+
+def unet(inputs):
+    conv1, pool = unet_block(64, inputs)
+    conv2, pool = unet_block(128, pool)
+    drop = central_conv_block(256, pool)
+    
+    deconv2 = unet_decodeblock(128,conv2,drop)
+    deconv1 = unet_decodeblock(64,conv1,deconv2)
+
+    conv9 = Conv2D(filters=16, kernel_size=(3, 3), strides=(1, 2), activation = 'relu', padding = 'same', kernel_initializer = 'he_normal')(deconv1)
+   # conv10 = Conv2D(filters=5, kernel_size=(1, 1), activation = 'relu')(conv9)
+    
+    return conv9
+
+def florblock(filters,strides,input_data):
+    cnn = Conv2D(filters=filters, kernel_size=(3, 3), strides=strides, padding="same", kernel_initializer="he_uniform")(input_data)
+    cnn = PReLU(shared_axes=[1, 2])(cnn)
+    cnn = BatchNormalization(renorm=True)(cnn)
+  #  cnn = Attention(filters)(cnn)
+    cnn = FullGatedConv2D(filters=filters, kernel_size=(3, 3), padding="same")(cnn)
+    return cnn
+
+def uFlorPP(input_size, d_model):
+    input_data = Input(name="input", shape=input_size)
+    
+    cnn_pp = pushPull2D(filters=16, kernel_size=(3, 3),strides=(1, 2), padding="same", kernel_initializer="he_uniform")(input_data)
+    cnn = PReLU(shared_axes=[1, 2])(cnn_pp)
+    cnn = BatchNormalization(renorm=True)(cnn)
+    #cnn = unet(cnn)
+    cnn = Attention(16)(cnn)
+    cnn = FullGatedConv2D(filters=16, kernel_size=(3, 3), padding="same")(cnn)
+
+    cnn = florblock(32,(1,1),cnn)
+    cnn = florblock(40,(1,2),cnn)
+    cnn = florblock(48,(1,1),cnn)
+    cnn = florblock(56,(1,2),cnn)
+    cnn = florblock(64,(1,1),cnn)
+    cnn = florblock(72,(2,4),cnn)
+
+    cnn = Conv2D(filters=80, kernel_size=(3, 3), strides=(1, 1), padding="same", kernel_initializer="he_uniform")(cnn)
+    cnn = PReLU(shared_axes=[1, 2])(cnn)
+    cnn = BatchNormalization(renorm=True)(cnn)
+
+    shape = cnn.get_shape()
+    bgru = Reshape((shape[1], shape[2] * shape[3]))(cnn)
+
+    bgru = Bidirectional(GRU(units=256, return_sequences=True, dropout=0.5))(bgru)
+    bgru = MultiHeadAttention(4,2,dropout=0.1)(bgru,bgru)
+    bgru = Dense(units=512)(bgru)#Increase to the setence number
+
+    bgru = Bidirectional(GRU(units=256, return_sequences=True, dropout=0.5))(bgru)
+    output_data = Dense(units=d_model, activation="softmax")(bgru)
+
+    return (input_data, output_data)
 """
 HTRModel Class based on:
     Y. Soullard, C. Ruffino and T. Paquet,
@@ -482,7 +555,145 @@ def flor(input_size, d_model):
 
     return (input_data, output_data)
 
+def florPP(input_size, d_model):
+    input_data = Input(name="input", shape=input_size)
 
+    cnn_pp = pushPull2D(filters=16, kernel_size=(3, 3), strides=(1, 2), padding="same", kernel_initializer="he_uniform")(input_data)
+    cnn = PReLU(shared_axes=[1, 2])(cnn_pp)
+    cnn = BatchNormalization(renorm=True)(cnn)
+#    
+    cnn = FullGatedConv2D(filters=16, kernel_size=(3, 3), padding="same")(cnn)
+
+    cnn = Conv2D(filters=32, kernel_size=(3, 3), strides=(1, 1), padding="same", kernel_initializer="he_uniform")(cnn)
+    cnn = PReLU(shared_axes=[1, 2])(cnn)
+    cnn = BatchNormalization(renorm=True)(cnn)
+    cnn = FullGatedConv2D(filters=32, kernel_size=(3, 3), padding="same")(cnn)
+
+    cnn = Conv2D(filters=40, kernel_size=(2, 4), strides=(2, 4), padding="same", kernel_initializer="he_uniform")(cnn)
+    cnn = PReLU(shared_axes=[1, 2])(cnn)
+    cnn = BatchNormalization(renorm=True)(cnn)
+    cnn = FullGatedConv2D(filters=40, kernel_size=(3, 3), padding="same", kernel_constraint=MaxNorm(4, [0, 1, 2]))(cnn)
+    cnn = Dropout(rate=0.2)(cnn)
+
+    cnn = Conv2D(filters=48, kernel_size=(3, 3), strides=(1, 1), padding="same", kernel_initializer="he_uniform")(cnn)
+    cnn = PReLU(shared_axes=[1, 2])(cnn)
+    cnn = BatchNormalization(renorm=True)(cnn)
+    cnn = FullGatedConv2D(filters=48, kernel_size=(3, 3), padding="same", kernel_constraint=MaxNorm(4, [0, 1, 2]))(cnn)
+    cnn = Dropout(rate=0.2)(cnn)
+
+    cnn = Conv2D(filters=56, kernel_size=(2, 4), strides=(2, 4), padding="same", kernel_initializer="he_uniform")(cnn)
+    cnn = PReLU(shared_axes=[1, 2])(cnn)
+    cnn = BatchNormalization(renorm=True)(cnn)
+    cnn = FullGatedConv2D(filters=56, kernel_size=(3, 3), padding="same", kernel_constraint=MaxNorm(4, [0, 1, 2]))(cnn)
+    cnn = Dropout(rate=0.2)(cnn)
+
+    cnn = Conv2D(filters=64, kernel_size=(3, 3), strides=(1, 1), padding="same", kernel_initializer="he_uniform")(cnn)
+    cnn = PReLU(shared_axes=[1, 2])(cnn)
+    cnn = BatchNormalization(renorm=True)(cnn)
+
+    shape = cnn.get_shape()
+    bgru = Reshape((shape[1], shape[2] * shape[3]))(cnn)
+
+    bgru = Bidirectional(GRU(units=128, return_sequences=True, dropout=0.5))(bgru)
+    bgru = Dense(units=256)(bgru)
+
+    bgru = Bidirectional(GRU(units=128, return_sequences=True, dropout=0.5))(bgru)
+    output_data = Dense(units=d_model, activation="softmax")(bgru)
+
+    return (input_data, output_data)
+
+def florAT(input_size, d_model):
+    input_data = Input(name="input", shape=input_size)
+
+    cnn_pp = pushPull2D(filters=16, kernel_size=(3, 3), strides=(1, 2), padding="same", kernel_initializer="he_uniform")(input_data)
+    cnn = PReLU(shared_axes=[1, 2])(cnn_pp)
+    cnn = BatchNormalization(renorm=True)(cnn)
+    cnn = Attention(16)(cnn)
+    cnn = FullGatedConv2D(filters=16, kernel_size=(3, 3), padding="same")(cnn)
+
+    cnn = Conv2D(filters=32, kernel_size=(3, 3), strides=(1, 1), padding="same", kernel_initializer="he_uniform")(cnn)
+    cnn = PReLU(shared_axes=[1, 2])(cnn)
+    cnn = BatchNormalization(renorm=True)(cnn)
+    cnn = Attention(32)(cnn)
+    cnn = FullGatedConv2D(filters=32, kernel_size=(3, 3), padding="same")(cnn)
+
+    cnn = Conv2D(filters=40, kernel_size=(2, 4), strides=(2, 4), padding="same", kernel_initializer="he_uniform")(cnn)
+    cnn = PReLU(shared_axes=[1, 2])(cnn)
+    cnn = BatchNormalization(renorm=True)(cnn)
+    cnn = Attention(40)(cnn)
+    cnn = FullGatedConv2D(filters=40, kernel_size=(3, 3), padding="same", kernel_constraint=MaxNorm(4, [0, 1, 2]))(cnn)
+    cnn = Dropout(rate=0.2)(cnn)
+
+    cnn = Conv2D(filters=48, kernel_size=(3, 3), strides=(1, 1), padding="same", kernel_initializer="he_uniform")(cnn)
+    cnn = PReLU(shared_axes=[1, 2])(cnn)
+    cnn = BatchNormalization(renorm=True)(cnn)
+    cnn = Attention(48)(cnn)
+    cnn = FullGatedConv2D(filters=48, kernel_size=(3, 3), padding="same", kernel_constraint=MaxNorm(4, [0, 1, 2]))(cnn)
+    cnn = Dropout(rate=0.2)(cnn)
+
+    cnn = Conv2D(filters=56, kernel_size=(2, 4), strides=(2, 4), padding="same", kernel_initializer="he_uniform")(cnn)
+    cnn = PReLU(shared_axes=[1, 2])(cnn)
+    cnn = BatchNormalization(renorm=True)(cnn)
+    cnn = Attention(56)(cnn)
+    cnn = FullGatedConv2D(filters=56, kernel_size=(3, 3), padding="same", kernel_constraint=MaxNorm(4, [0, 1, 2]))(cnn)
+    cnn = Dropout(rate=0.2)(cnn)
+
+    cnn = Conv2D(filters=64, kernel_size=(3, 3), strides=(1, 1), padding="same", kernel_initializer="he_uniform")(cnn)
+    cnn = PReLU(shared_axes=[1, 2])(cnn)
+    cnn = BatchNormalization(renorm=True)(cnn)
+
+    shape = cnn.get_shape()
+    bgru = Reshape((shape[1], shape[2] * shape[3]))(cnn)
+
+    bgru = Bidirectional(GRU(units=128, return_sequences=True, dropout=0.5))(bgru)
+    bgru = MultiHeadAttention(4,2,dropout=0.1)(bgru,bgru)
+    bgru = Dense(units=256)(bgru)
+
+    bgru = Bidirectional(GRU(units=128, return_sequences=True, dropout=0.5))(bgru)
+    output_data = Dense(units=d_model, activation="softmax")(bgru)
+
+    return (input_data, output_data)
+
+def florBN(input_size, d_model):
+    input_data = Input(name="input", shape=input_size)
+
+    cnn_pp = pushPull2D(filters=16, kernel_size=(3, 3), strides=(1, 2), padding="same", kernel_initializer="he_uniform")(input_data)
+    cnn = PReLU(shared_axes=[1, 2])(cnn_pp)
+    cnn = FullGatedConv2D(filters=16, kernel_size=(3, 3), padding="same")(cnn)
+
+    cnn = Conv2D(filters=32, kernel_size=(3, 3), strides=(1, 1), padding="same", kernel_initializer="he_uniform")(cnn)
+    cnn = PReLU(shared_axes=[1, 2])(cnn)
+    cnn = FullGatedConv2D(filters=32, kernel_size=(3, 3), padding="same")(cnn)
+
+    cnn = Conv2D(filters=40, kernel_size=(2, 4), strides=(2, 4), padding="same", kernel_initializer="he_uniform")(cnn)
+    cnn = PReLU(shared_axes=[1, 2])(cnn)
+    cnn = FullGatedConv2D(filters=40, kernel_size=(3, 3), padding="same", kernel_constraint=MaxNorm(4, [0, 1, 2]))(cnn)
+    cnn = Dropout(rate=0.2)(cnn)
+
+    cnn = Conv2D(filters=48, kernel_size=(3, 3), strides=(1, 1), padding="same", kernel_initializer="he_uniform")(cnn)
+    cnn = PReLU(shared_axes=[1, 2])(cnn)
+    cnn = FullGatedConv2D(filters=48, kernel_size=(3, 3), padding="same", kernel_constraint=MaxNorm(4, [0, 1, 2]))(cnn)
+    cnn = Dropout(rate=0.2)(cnn)
+
+    cnn = Conv2D(filters=56, kernel_size=(2, 4), strides=(2, 4), padding="same", kernel_initializer="he_uniform")(cnn)
+    cnn = PReLU(shared_axes=[1, 2])(cnn)
+    cnn = FullGatedConv2D(filters=56, kernel_size=(3, 3), padding="same", kernel_constraint=MaxNorm(4, [0, 1, 2]))(cnn)
+    cnn = Dropout(rate=0.2)(cnn)
+
+    cnn = Conv2D(filters=64, kernel_size=(3, 3), strides=(1, 1), padding="same", kernel_initializer="he_uniform")(cnn)
+    cnn = PReLU(shared_axes=[1, 2])(cnn)
+    cnn = BatchNormalization(renorm=True)(cnn)
+
+    shape = cnn.get_shape()
+    bgru = Reshape((shape[1], shape[2] * shape[3]))(cnn)
+
+    bgru = Bidirectional(GRU(units=128, return_sequences=True, dropout=0.5))(bgru)
+    bgru = Dense(units=256)(bgru)
+
+    bgru = Bidirectional(GRU(units=128, return_sequences=True, dropout=0.5))(bgru)
+    output_data = Dense(units=d_model, activation="softmax")(bgru)
+
+    return (input_data, output_data)
 def puigcerver_octconv(input_size, d_model):
     """
     Octave CNN by khinggan, architecture is same as puigcerver

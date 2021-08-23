@@ -61,7 +61,7 @@ class DataGenerator():
             index = self.index['train']
             until = index + self.batch_size
             self.index['train'] = until
-
+            
             x_train = self.dataset['train']['dt'][index:until]
             x_train = pp.augmentation(x_train,
                                       rotation_range=1.5,
@@ -73,10 +73,19 @@ class DataGenerator():
             x_train = pp.normalization(x_train)
 
             y_train = [self.tokenizer.encode(y) for y in self.dataset['train']['gt'][index:until]]
-            y_train = [np.pad(y, (0, self.tokenizer.maxlen - len(y))) for y in y_train]
+      
+            y_train = [self.crateTrain(y) for y in y_train]
             y_train = np.asarray(y_train, dtype=np.int16)
 
             yield (x_train, y_train)
+
+    def crateTrain(self,y):
+        bounds = (0, max(self.tokenizer.maxlen - len(y),0))
+        pad = np.pad(y, bounds)
+        while(len(pad) - self.tokenizer.maxlen > 0):
+            pad = np.delete(pad, len(pad) - self.tokenizer.maxlen, 0)
+        return pad
+        
 
     def next_valid_batch(self):
         """Get the next batch from validation partition (yield)"""
@@ -95,7 +104,7 @@ class DataGenerator():
             x_valid = pp.normalization(x_valid)
 
             y_valid = [self.tokenizer.encode(y) for y in self.dataset['valid']['gt'][index:until]]
-            y_valid = [np.pad(y, (0, self.tokenizer.maxlen - len(y))) for y in y_valid]
+            y_valid = [self.crateTrain(y) for y in y_valid]
             y_valid = np.asarray(y_valid, dtype=np.int16)
 
             yield (x_valid, y_valid)

@@ -5,8 +5,150 @@ Gated implementations
                      This process will double number of filters to make one convolutional process.
 """
 
+import tensorflow as tf
 from tensorflow.keras import backend as K
-from tensorflow.keras.layers import Layer, Conv2D, Multiply, Activation
+from tensorflow.keras.layers import Layer, Conv2D, Multiply, Activation, ReLU, Lambda, Subtract, SpatialDropout2D, Dropout
+from tensorflow.keras.initializers import RandomUniform, Constant
+from tensorflow.keras import initializers,regularizers
+import math
+import numpy as np
+import random 
+
+class DoubleDropout(Layer):
+    def __init__(self,rate=.2,rate_b=.2, **kwargs):
+        super().__init__(**kwargs)
+        self.dropout2d = SpatialDropout2D(rate_b)
+        self.dropout = Dropout(rate)
+
+    def call(self, inputs):
+        if random.random() < 0.5:
+            return self.dropout(inputs)
+        return self.dropout2d(inputs)
+
+class Attention(Layer):
+    def __init__(self,
+                 filters,
+                 kernel_initializer="glorot_uniform",
+                 **kwargs):
+
+        super().__init__(filters,**kwargs)
+        self.filters = filters
+        
+        self.kernel_size = (3,3)
+        self.kernel_value_size = (1,1)
+        
+        self.query_kernel = self.add_weight(name="query_kernel",
+                                           shape=(*self.kernel_size,1, self.filters),
+                                           initializer=kernel_initializer)
+                                           
+        self.key_kernel = self.add_weight(name="key_kernel",
+                                           shape=(*self.kernel_size,1, self.filters),
+                                           initializer=kernel_initializer)
+                                           
+        self.value_kernel = self.add_weight(name="value_kernel",
+                                           shape=(*self.kernel_value_size,1, self.filters),
+                                           initializer=kernel_initializer)
+        self.final_kernel = self.add_weight(name="final_kernel",
+                                           shape=(*self.kernel_value_size,1, self.filters),
+                                           initializer=kernel_initializer)
+        self.negative = tf.constant(-1.)
+        self.Bq = tf.keras.layers.BatchNormalization(renorm=True)
+        self.Bk = tf.keras.layers.BatchNormalization(renorm=True)
+        self.Bv = tf.keras.layers.BatchNormalization(renorm=True)
+
+    def call(self, inputs):
+        #Query
+        q = K.conv2d(inputs,self.query_kernel,padding="same",data_format="channels_last")
+        
+        #Key
+        k = K.conv2d(inputs,self.key_kernel,padding="same",data_format="channels_last")
+        
+        #Value
+        v = K.conv2d(inputs,self.value_kernel,padding="same",data_format="channels_last")
+        
+        # N = h * wi
+        s = tf.matmul(self.Bq(q), self.Bk(k),transpose_b=True)
+        
+        # attention map
+        attention_map = K.softmax(s)
+
+        s = tf.matmul(attention_map,self.Bv(v))
+        
+        o = K.conv2d(s,self.final_kernel,padding="same",data_format="channels_last")
+
+        return o + inputs
+
+
+
+class pushPull2D(Layer):
+    """Gated Convolutional Class"""
+    def __init__(self,
+                 filters,
+                 kernel_size=(3,3),
+                 input_shape=(1,1,1,3),
+                 strides=(1,1),
+                 padding="same",
+                 kernel_initializer="glorot_uniform",
+                 scale=2,
+                 alpha=1,
+                 train_alpha=True,
+                 **kwargs):
+        assert alpha >= 0 and alpha <= 10
+
+        super().__init__(filters,**kwargs)
+        self.train_alpha = train_alpha
+        self.filters = filters
+        self.kernel_size = kernel_size
+        self.strides = strides
+        self.padding = padding
+        self.scale_factor = scale
+        
+        self.push_kernel = self.add_weight(name="push_kernel",
+                                           shape=(*self.kernel_size,1, self.filters),
+                                           initializer=kernel_initializer)
+                                           
+        self.pull_kernel = self.add_weight(name="pull_kernel",
+                                           shape=(*self.kernel_size,1, self.filters),
+                                           initializer=kernel_initializer)
+                                           
+        if self.train_alpha:
+            k = filters
+            r = 1. / math.sqrt(input_shape[3] * filters)
+            alpha_weight = tf.Variable(tf.random_uniform_initializer(minval=0.5-r, maxval=0.5+r)(shape=[1], dtype=tf.float32))
+            self.alpha = K.relu(alpha_weight)
+        else:
+            self.alpha = tf.Variable(alpha, dtype=np.float32, trainable=False)
+        self.negative = tf.constant(-1.)
+
+    def call(self, inputs):
+        #Push
+        push_first_step = K.conv2d(inputs,self.push_kernel,strides=self.strides,padding=self.padding,data_format="channels_last")
+        push_final_step = K.relu(push_first_step)
+        
+        #Calculate pull variables
+        push_size = push_first_step.shape[3]
+        
+        if self.scale_factor != 1:
+            pull_size = math.floor(push_size * self.scale_factor)
+            if pull_size % 2 == 0:
+                pull_size += 1
+            
+        #Pull
+        pull_step_zero = K.conv2d(inputs,self.pull_kernel,strides=self.strides, padding=self.padding,data_format="channels_last") 
+        
+        if self.scale_factor != 1:
+            pull_first_step = pull_step_zero
+        else:
+            pull_first_step = K.UpSampling2D(size=(pull_size, pull_size),
+                                      interpolation='bilinear')(pull_step_zero)
+                                    
+        pull_second_step = K.relu(pull_first_step)
+        pull_third_step = pull_second_step * self.alpha
+        pull_final_step = pull_third_step * self.negative 
+        
+        #Push x Pull        
+        return push_final_step - pull_final_step
+
 
 """
 Tensorflow Keras layer implementation of the gated convolution.
@@ -68,7 +210,6 @@ class FullGatedConv2D(Conv2D):
 
     def call(self, inputs):
         """Apply gated convolution"""
-
         output = super(FullGatedConv2D, self).call(inputs)
         linear = Activation("linear")(output[:, :, :, :self.nb_filters])
         sigmoid = Activation("sigmoid")(output[:, :, :, self.nb_filters:])
@@ -79,8 +220,8 @@ class FullGatedConv2D(Conv2D):
         """Compute shape of layer output"""
 
         output_shape = super(FullGatedConv2D, self).compute_output_shape(input_shape)
-        return tuple(output_shape[:3]) + (self.nb_filters,)
-
+        return tuple(output_shape[:3]) + (self.nb_filters* 2,)
+    
     def get_config(self):
         """Return the config of the layer"""
 
